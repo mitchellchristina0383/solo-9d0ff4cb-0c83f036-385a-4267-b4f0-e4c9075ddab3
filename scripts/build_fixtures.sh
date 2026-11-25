@@ -54,6 +54,39 @@ gcc -O0 -g -gdwarf-5 -fno-pie -no-pie \
     -Wl,--build-id=0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
     "$SRC/demo_conflict.c" -o "$OUT/demo-aaaa-CONFLICT.elf"
 
+# 2b) 移交专用：同一 Build ID（dddd…）的两份内容不同的 ELF，
+# 函数名刻意不同，便于断言两份移交报告各自解析到随单文件。
+cat > "$SRC/handoff_v1.c" <<'EOF'
+int handoff_origin_func(int n) {
+    int r = n + 100;       /* handoff v1 line */
+    return r;
+}
+
+int main(void) { return handoff_origin_func(1); }
+EOF
+cat > "$SRC/handoff_v2.c" <<'EOF'
+int handoff_origin_func(int n) {
+    int r = n + 100;
+    return r;
+}
+
+int handoff_extra_func(int n) {     /* 仅 v2 存在的函数，保证内容与 v1 不同 */
+    return n * 7;
+}
+
+int main(void) { return handoff_origin_func(1) + handoff_extra_func(2); }
+EOF
+gcc -O0 -g -gdwarf-5 -fno-pie -no-pie \
+    -Wl,--build-id=0xdddddddddddddddddddddddddddddddddddddddd \
+    "$SRC/handoff_v1.c" -o "$OUT/handoff-dddd-v1.elf"
+gcc -O0 -g -gdwarf-5 -fno-pie -no-pie \
+    -Wl,--build-id=0xdddddddddddddddddddddddddddddddddddddddd \
+    "$SRC/handoff_v2.c" -o "$OUT/handoff-dddd-v2.elf"
+# 另一个独立 Build ID 的移交 ELF，覆盖一单多 Build ID
+gcc -O0 -g -gdwarf-5 -shared -fPIC \
+    -Wl,--build-id=0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee \
+    "$SRC/other.c" -o "$OUT/handoff-eeee.elf"
+
 # 3) 缺 Build ID
 gcc -O0 -g -gdwarf-5 -fno-pie -no-pie -Wl,--build-id=none \
     "$SRC/demo.c" -o "$OUT/no-buildid.elf"

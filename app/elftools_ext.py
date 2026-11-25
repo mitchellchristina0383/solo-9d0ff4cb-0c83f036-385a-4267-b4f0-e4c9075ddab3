@@ -123,7 +123,6 @@ class _CUUnit:
 class _ParsedELF:
     """单个 ELF 的只读解析结果，可被多线程共享。"""
 
-    build_id: str
     cu_units: list[_CUUnit]  # 按 low 升序
     symtab: list[tuple[int, int, str]]  # (low, high, name) 按 low 升序
 
@@ -231,7 +230,7 @@ def _cu_bounds(dwarf, cu, line_hits: list[_LineHit]) -> Optional[tuple[int, int]
     return None
 
 
-def _parse_file(path: str, build_id: str) -> _ParsedELF:
+def _parse_file(path: str) -> _ParsedELF:
     with open(path, "rb") as fh:
         elf = ELFFile(fh)
         if not elf.has_dwarf_info():
@@ -283,26 +282,28 @@ def _parse_file(path: str, build_id: str) -> _ParsedELF:
 
     cu_units.sort(key=lambda u: u.low)
     symtab.sort(key=lambda s: s[0])
-    return _ParsedELF(build_id=build_id, cu_units=cu_units, symtab=symtab)
+    return _ParsedELF(cu_units=cu_units, symtab=symtab)
 
 
 class Symbolizer:
-    """按文件路径惰性解析并缓存 _ParsedELF。
+    """按文件内容哈希惰性解析并缓存 _ParsedELF。
 
-    缓存键带发布版本，文件一旦发布即不可变，因此缓存可长期复用。
+    缓存键为 sha256 而非 Build ID：移交场景允许不同报告各自持有同 Build ID
+    但内容不同的 ELF，只有内容哈希才能同时区分并缓存它们。文件一旦落盘即
+    内容不可变，因此同一哈希的解析结果可长期跨线程共享。
     """
 
     def __init__(self) -> None:
         self._cache: dict[str, _ParsedELF] = {}
 
-    def symbolize(self, path: str, build_id: str, address: int) -> FrameSymbol:
-        parsed = self._cache.get(build_id)
+    def symbolize(self, path: str, content_key: str, address: int) -> FrameSymbol:
+        parsed = self._cache.get(content_key)
         if parsed is None:
-            parsed = _parse_file(path, build_id)
-            self._cache[build_id] = parsed
+            parsed = _parse_file(path)
+            self._cache[content_key] = parsed
         function = parsed.lookup_function(address)
         file, line = parsed.lookup_line(address)
         return FrameSymbol(function=function, file=file, line=line)
 
-    def evict(self, build_id: str) -> None:
-        self._cache.pop(build_id, None)
+    def evict(self, content_key: str) -> None:
+        self._cache.pop(content_key, None)

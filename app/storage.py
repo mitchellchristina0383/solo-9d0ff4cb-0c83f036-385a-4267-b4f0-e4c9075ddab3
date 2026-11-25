@@ -1,9 +1,13 @@
 """持久化与发布控制。
 
-- ELF 按 sha256 内容寻址存放，Build ID -> 内容哈希映射写入 SQLite；
+- ELF 按 sha256 内容寻址存放（已发布符号与移交随单 ELF 共用内容目录，
+  同字节文件只落盘一份），Build ID -> 内容哈希映射写入 SQLite；
 - 每次整批发布把全局版本号 +1，查询只绑定解析开始时的版本快照；
 - 发布全程持写锁并在同一事务内完成，任何一文件不合格则整批退回、不落盘；
-- 重启后从 SQLite 恢复映射并核对磁盘文件，报告与帧同样持久化，可继续查询。
+- 移交单（handoff）的报告、帧与 report_elfs 绑定单事务原子登记，失败不留痕；
+  绑定仅对本报告可见，不同报告可各持同 Build ID 的不同内容 ELF；
+- 符号解析缓存按 sha256 键控，同 Build ID 异内容文件不会串缓存；
+- 重启后从 SQLite 恢复映射并核对磁盘文件，报告/绑定同样持久化，可继续查询。
 """
 from __future__ import annotations
 
@@ -32,6 +36,30 @@ class BatchRejected(Exception):
     def __init__(self, errors: list[str]):
         super().__init__("; ".join(errors))
         self.errors = errors
+
+
+class HandoffRejected(Exception):
+    """移交单校验未通过（文件不合格、Build ID 覆盖不全等），整单不收。"""
+
+    def __init__(self, errors: list[str]):
+        super().__init__("; ".join(errors))
+        self.errors = errors
+
+
+class HandoffConflict(Exception):
+    """同来源同原报告号重送，但帧或 Build ID 对应文件内容与首次移交不一致。"""
+
+    def __init__(self, errors: list[str]):
+        super().__init__("; ".join(errors))
+        self.errors = errors
+
+
+def _normalize_build_id(build_id: Optional[str]) -> Optional[str]:
+    """Build ID 统一去空白、转小写；空串视为缺失。"""
+    if build_id is None:
+        return None
+    bid = build_id.strip().lower()
+    return bid or None
 
 
 class Store:
@@ -80,6 +108,22 @@ class Store:
                     address   TEXT NOT NULL,
                     UNIQUE(report_id, position)
                 );
+                CREATE TABLE IF NOT EXISTS handoffs (
+                    report_id           INTEGER PRIMARY KEY REFERENCES reports(id),
+                    source_instance     TEXT NOT NULL,
+                    original_report_no  TEXT NOT NULL,
+                    snapshot_symbol_version INTEGER NOT NULL,
+                    UNIQUE(source_instance, original_report_no)
+                );
+                CREATE TABLE IF NOT EXISTS report_elfs (
+                    report_id INTEGER NOT NULL REFERENCES reports(id),
+                    build_id  TEXT NOT NULL,
+                    sha256    TEXT NOT NULL,
+                    path      TEXT NOT NULL,
+                    PRIMARY KEY (report_id, build_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_report_elfs_sha
+                    ON report_elfs(sha256);
                 """
             )
             self._conn.execute(
@@ -87,12 +131,23 @@ class Store:
             )
 
     def _reconcile_disk(self) -> None:
-        """重启后核对：磁盘缺失的内容文件删除其映射，保证不悬挂。"""
+        """重启后核对：磁盘缺失的内容文件删除其映射，保证不悬挂。
+
+        已发布符号（elfs）与移交单绑定（report_elfs）共用内容寻址目录，
+        两类映射都要核对；绑定缺失的帧在查询时明确报
+        bound_symbol_unavailable 而非静默退回未发布状态。
+        """
         with self._lock, self._conn:
-            for row in self._conn.execute("SELECT build_id, path FROM elfs").fetchall():
-                if not os.path.isfile(row["path"]):
-                    self._conn.execute("DELETE FROM elfs WHERE build_id=?", (row["build_id"],))
-                    self._symbolizer.evict(row["build_id"])
+            for table in ("elfs", "report_elfs"):
+                rows = self._conn.execute(
+                    f"SELECT DISTINCT sha256, path FROM {table}"
+                ).fetchall()
+                for row in rows:
+                    if not os.path.isfile(row["path"]):
+                        self._conn.execute(
+                            f"DELETE FROM {table} WHERE sha256=?", (row["sha256"],)
+                        )
+                        self._symbolizer.evict(row["sha256"])
 
     @property
     def symbol_version(self) -> int:
@@ -233,6 +288,217 @@ class Store:
         }
 
     # ------------------------------------------------------------------
+    # 移交（handoff）：来源实例 + 原报告号 + 原始帧 + 随单 ELF
+    # ------------------------------------------------------------------
+    def intake_handoff(
+        self,
+        source_instance: str,
+        original_report_no: str,
+        frames: list[dict],
+        files: list[tuple[str, bytes]],
+    ) -> dict:
+        """登记一份跨实例移交的崩溃报告及其随单 ELF。
+
+        校验全部通过前不落盘、不写库；通过后报告、帧、Build ID 绑定在同一
+        事务内原子登记。同来源同原报告号重送时做幂等判定：
+        帧与 build_id->sha256 完全一致返回原本地号，否则抛 HandoffConflict。
+        """
+        source_instance = (source_instance or "").strip()
+        original_report_no = (original_report_no or "").strip()
+        if not source_instance:
+            raise HandoffRejected(["source_instance 不能为空"])
+        if not original_report_no:
+            raise HandoffRejected(["original_report_no 不能为空"])
+        if not frames:
+            raise HandoffRejected(["原始帧不能为空"])
+
+        # 规范化帧；地址按原始字符串持久化，Build ID 统一小写
+        norm_frames: list[dict] = []
+        required_build_ids: set[str] = set()
+        for pos, frame in enumerate(frames):
+            address = frame.get("address")
+            if address is None or str(address).strip() == "":
+                raise HandoffRejected([f"第 {pos} 帧缺少 address"])
+            bid = _normalize_build_id(frame.get("build_id"))
+            norm_frames.append({"build_id": bid, "address": str(address)})
+            if bid:
+                required_build_ids.add(bid)
+
+        # 第一阶段：纯内存校验每个文件（沿用发布同款校验），同单内同 Build ID
+        # 内容不同即拒收；同内容重复文件按去重处理。
+        errors: list[str] = []
+        unique: dict[str, tuple[str, bytes, str]] = {}  # build_id -> (filename, blob, sha256)
+        for filename, blob in files:
+            if not blob:
+                errors.append(f"{filename}: 文件为空")
+                continue
+            try:
+                build_id, _ = inspect_blob(blob)
+            except ELFValidationError as exc:
+                errors.append(f"{filename}: {exc}")
+                continue
+            digest = hashlib.sha256(blob).hexdigest()
+            prev = unique.get(build_id)
+            if prev is not None:
+                if prev[2] != digest:
+                    errors.append(
+                        f"{filename}: Build ID {build_id} 与同单文件 {prev[0]} 内容不同"
+                    )
+                # 同内容重复文件直接去重，保留首次出现的那份
+                continue
+            unique[build_id] = (filename, blob, digest)
+
+        # 覆盖性核对：帧里每个非空 Build ID 都须有一个通过校验的对应文件，
+        # 随单文件也不允许带帧未引用的 Build ID（整单语义自洽）。
+        supplied = set(unique.keys())
+        for bid in sorted(required_build_ids - supplied):
+            errors.append(f"帧引用的 Build ID {bid} 缺少随单 ELF 文件")
+        for bid in sorted(supplied - required_build_ids):
+            errors.append(
+                f"随单文件 Build ID {bid} 未被任何帧引用，移交单不接受多余文件"
+            )
+
+        with self._lock:
+            # 幂等判定：同来源同原报告号是否已登记
+            existing = self._conn.execute(
+                "SELECT h.report_id AS report_id, h.snapshot_symbol_version AS snap"
+                " FROM handoffs h WHERE source_instance=? AND original_report_no=?",
+                (source_instance, original_report_no),
+            ).fetchone()
+            if existing is not None:
+                self._check_handoff_replay(
+                    existing["report_id"], norm_frames, unique, errors
+                )
+                if errors:
+                    raise HandoffConflict(sorted(set(errors)))
+                # 完全一致：幂等返回原本地号，不产生任何写入
+                result = self.resolve_report(existing["report_id"])
+                result["idempotent_replay"] = True
+                result["source_instance"] = source_instance
+                result["original_report_no"] = original_report_no
+                return result
+
+            if errors:
+                raise HandoffRejected(sorted(set(errors)))
+
+            # 第二阶段：内容文件暂存落盘（os.replace 原子可见），随后单事务
+            # 写报告/帧/移交信息/绑定；事务失败则清理本次暂存文件。
+            snapshot_version = self.symbol_version
+            staged: list[tuple[str, str, str]] = []  # (build_id, sha256, path)
+            staged_paths: list[str] = []
+            for build_id, (_filename, blob, digest) in unique.items():
+                final_path = os.path.join(self.elf_dir, f"{digest}.elf")
+                if not os.path.exists(final_path):
+                    tmp_path = os.path.join(
+                        self.elf_dir,
+                        f".tmp-handoff-{os.getpid()}-{threading.get_ident()}-{digest}",
+                    )
+                    with open(tmp_path, "wb") as fh:
+                        fh.write(blob)
+                    os.replace(tmp_path, final_path)
+                    staged_paths.append(final_path)
+                staged.append((build_id, digest, final_path))
+
+            try:
+                with self._conn:  # 报告、帧、移交元数据、绑定单事务提交
+                    cur = self._conn.execute("INSERT INTO reports DEFAULT VALUES")
+                    report_id = cur.lastrowid
+                    self._conn.executemany(
+                        "INSERT INTO frames(report_id, position, build_id, address)"
+                        " VALUES(?,?,?,?)",
+                        [
+                            (report_id, pos, f["build_id"], f["address"])
+                            for pos, f in enumerate(norm_frames)
+                        ],
+                    )
+                    self._conn.execute(
+                        "INSERT INTO handoffs(report_id, source_instance,"
+                        " original_report_no, snapshot_symbol_version) VALUES(?,?,?,?)",
+                        (report_id, source_instance, original_report_no, snapshot_version),
+                    )
+                    self._conn.executemany(
+                        "INSERT INTO report_elfs(report_id, build_id, sha256, path)"
+                        " VALUES(?,?,?,?)",
+                        [(report_id, bid, digest, path) for bid, digest, path in staged],
+                    )
+            except BaseException:
+                for path in staged_paths:
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                raise
+
+        result = self.resolve_report(report_id)
+        result["idempotent_replay"] = False
+        result["source_instance"] = source_instance
+        result["original_report_no"] = original_report_no
+        return result
+
+    def _check_handoff_replay(
+        self,
+        report_id: int,
+        norm_frames: list[dict],
+        unique: dict[str, tuple[str, bytes, str]],
+        errors: list[str],
+    ) -> None:
+        """重送一致性核对：帧序列与 build_id->sha256 映射都必须与首送相同。"""
+        old_frames = self._conn.execute(
+            "SELECT position, build_id, address FROM frames"
+            " WHERE report_id=? ORDER BY position",
+            (report_id,),
+        ).fetchall()
+        if len(old_frames) != len(norm_frames):
+            errors.append(
+                f"重送帧数量 {len(norm_frames)} 与原单 {len(old_frames)} 不一致"
+            )
+        else:
+            for pos, (old, new) in enumerate(zip(old_frames, norm_frames)):
+                if old["build_id"] != new["build_id"] or old["address"] != new["address"]:
+                    errors.append(
+                        f"第 {pos} 帧与原单不一致："
+                        f"原 (build_id={old['build_id']}, address={old['address']})，"
+                        f"新 (build_id={new['build_id']}, address={new['address']})"
+                    )
+        old_bindings = {
+            r["build_id"]: r["sha256"]
+            for r in self._conn.execute(
+                "SELECT build_id, sha256 FROM report_elfs WHERE report_id=?",
+                (report_id,),
+            ).fetchall()
+        }
+        new_bindings = {bid: item[2] for bid, item in unique.items()}
+        if set(old_bindings) != set(new_bindings):
+            errors.append(
+                f"重送 Build ID 集合与原单不一致：原 {sorted(old_bindings)}，"
+                f"新 {sorted(new_bindings)}"
+            )
+        for bid, digest in new_bindings.items():
+            if bid in old_bindings and old_bindings[bid] != digest:
+                errors.append(
+                    f"Build ID {bid} 对应文件内容与原单不同（sha256 不一致）"
+                )
+
+    def _handoff_meta(self, report_id: int) -> Optional[sqlite3.Row]:
+        return self._conn.execute(
+            "SELECT report_id, source_instance, original_report_no,"
+            " snapshot_symbol_version FROM handoffs WHERE report_id=?",
+            (report_id,),
+        ).fetchone()
+
+    def _handoff_bindings(self, report_id: int) -> dict[str, StoredELF]:
+        rows = self._conn.execute(
+            "SELECT build_id, sha256, path FROM report_elfs WHERE report_id=?",
+            (report_id,),
+        ).fetchall()
+        return {
+            r["build_id"]: StoredELF(
+                r["build_id"], r["sha256"], r["path"], 0
+            )
+            for r in rows
+        }
+
+    # ------------------------------------------------------------------
     # 快照符号化
     # ------------------------------------------------------------------
     def snapshot_paths(self, version: int) -> dict[str, StoredELF]:
@@ -247,11 +513,21 @@ class Store:
         }
 
     def resolve_report(self, report_id: int, snapshot_version: Optional[int] = None) -> Optional[dict]:
-        version = self.symbol_version if snapshot_version is None else snapshot_version
         raw = self.get_report_raw(report_id)
         if raw is None:
             return None
-        available = self.snapshot_paths(version)
+        handoff = self._handoff_meta(report_id)
+        if handoff is not None:
+            # 移交报告只使用随单绑定的 ELF，与已发布符号池完全隔离；
+            # 快照版本固定为移交登记时刻的全局符号版本（普通符号不参与解析，
+            # 仅用于响应展示与跨重启一致性）。
+            version = handoff["snapshot_symbol_version"]
+            available = self._handoff_bindings(report_id)
+            missing_reason = "bound_symbol_unavailable"
+        else:
+            version = self.symbol_version if snapshot_version is None else snapshot_version
+            available = self.snapshot_paths(version)
+            missing_reason = "build_id_not_published_at_snapshot"
         resolved_frames = []
         for frame in raw["frames"]:
             item = {
@@ -270,7 +546,7 @@ class Store:
             else:
                 stored = available.get(build_id.lower())
                 if stored is None:
-                    item["reason"] = "build_id_not_published_at_snapshot"
+                    item["reason"] = missing_reason
                 else:
                     try:
                         address = int(frame["address"], 0)
@@ -278,8 +554,9 @@ class Store:
                         item["reason"] = "invalid_address"
                         resolved_frames.append(item)
                         continue
+                    # 缓存键用内容哈希：同 Build ID 不同内容的两份 ELF 各自缓存
                     sym: FrameSymbol = self._symbolizer.symbolize(
-                        stored.path, stored.build_id, address
+                        stored.path, stored.sha256, address
                     )
                     item["function"] = sym.function
                     item["source_file"] = sym.file
@@ -289,7 +566,7 @@ class Store:
                         item["reason"] = "address_not_found_in_elf"
             resolved_frames.append(item)
         resolved_count = sum(1 for f in resolved_frames if f["status"] == "resolved")
-        return {
+        result = {
             "report_id": report_id,
             "created_at": raw["created_at"],
             "snapshot_symbol_version": version,
@@ -298,6 +575,13 @@ class Store:
             "resolved_count": resolved_count,
             "frames": resolved_frames,
         }
+        if handoff is not None:
+            result["handoff"] = {
+                "source_instance": handoff["source_instance"],
+                "original_report_no": handoff["original_report_no"],
+                "bound_build_ids": sorted(available.keys()),
+            }
+        return result
 
     def list_build_ids(self) -> list[dict]:
         rows = self._conn.execute(
